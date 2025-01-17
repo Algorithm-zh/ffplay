@@ -1571,6 +1571,7 @@ static void stream_toggle_pause(VideoState *is) {
     }
     set_clock(&is->vidclk, get_clock(&is->vidclk), is->vidclk.serial);
   }
+
   //将Clock::pts更新到最新的时间
   set_clock(&is->extclk, get_clock(&is->extclk), is->extclk.serial);
   is->paused = is->audclk.paused = is->vidclk.paused = is->extclk.paused = !is->paused;
