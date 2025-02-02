@@ -54,10 +54,10 @@
 #include "libavfilter/buffersink.h"
 #include "libavfilter/buffersrc.h"
 #endif
-#include <SDL.h>
+//#include <SDL.h>
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_thread.h>
-#include <SDL_thread.h>
+//#include <SDL_thread.h>
 
 #include "cmdutils.h"
 
@@ -291,6 +291,7 @@ typedef struct VideoState {
   unsigned int audio_buf_size; /* in bytes */
   unsigned int audio_buf1_size;
   int audio_buf_index; /* in bytes */
+  //代表当前缓存里还有多少数据没有拷贝给sdl
   int audio_write_buf_size;
   int audio_volume; // 播放器声音大小
   int muted;        // 是否静音
@@ -339,11 +340,12 @@ typedef struct VideoState {
                              // consider the jump a timestamp discontinuity
   struct SwsContext *img_convert_ctx;
   struct SwsContext *sub_convert_ctx;
+  //代表是否已经播放完毕
   int eof;
 
   char *filename;
   int width, height, xleft, ytop;
-  //为0代表逐帧播放
+  //为1代表逐帧播放
   int step;
 
 #if CONFIG_AVFILTER
@@ -458,10 +460,8 @@ static int opt_add_vfilter(void *optctx, const char *opt, const char *arg) {
 }
 #endif
 
-static inline int cmp_audio_fmts(enum AVSampleFormat fmt1,
-                                 int64_t channel_count1,
-                                 enum AVSampleFormat fmt2,
-                                 int64_t channel_count2) {
+static inline int cmp_audio_fmts(enum AVSampleFormat fmt1, int64_t channel_count1,
+                                 enum AVSampleFormat fmt2, int64_t channel_count2) {
   /* If channel count == 1, planar and non-planar formats are the same */
   if (channel_count1 == 1 && channel_count2 == 1)
     return av_get_packed_sample_fmt(fmt1) != av_get_packed_sample_fmt(fmt2);
@@ -471,8 +471,7 @@ static inline int cmp_audio_fmts(enum AVSampleFormat fmt1,
 
 static inline int64_t get_valid_channel_layout(int64_t channel_layout,
                                                int channels) {
-  if (channel_layout &&
-      av_get_channel_layout_nb_channels(channel_layout) == channels)
+  if (channel_layout && av_get_channel_layout_nb_channels(channel_layout) == channels)
     return channel_layout;
   else
     return 0;
@@ -1549,8 +1548,7 @@ static void check_external_clock_speed(VideoState *is) {
 
 /* seek in the stream */
 //标记跳转位置(并不会真的跳转)，并且唤醒read_thread
-static void stream_seek(VideoState *is, int64_t pos, int64_t rel,
-                        int seek_by_bytes) {
+static void stream_seek(VideoState *is, int64_t pos, int64_t rel, int seek_by_bytes) {
   if (!is->seek_req) {
     is->seek_pos = pos;
     is->seek_rel = rel;
@@ -1741,6 +1739,7 @@ static void video_refresh(void *opaque, double *remaining_time) {
       if (frame_queue_nb_remaining(&is->pictq) > 1) {
         Frame *nextvp = frame_queue_peek_next(&is->pictq);
         duration = vp_duration(is, vp, nextvp);
+        //可以看到如果是逐帧播放,就不会丢帧
         if (!is->step && (framedrop > 0 ||(framedrop && get_master_sync_type(is) != AV_SYNC_VIDEO_MASTER)) &&
             //要播放的帧是否已经过期
             time > is->frame_timer + duration) {
@@ -1794,6 +1793,7 @@ static void video_refresh(void *opaque, double *remaining_time) {
       is->force_refresh = 1;
 
 
+      //逐帧模式启动,会在播放完一帧后进入暂停状态
       if (is->step && !is->paused)
         stream_toggle_pause(is);
     }
@@ -1932,6 +1932,7 @@ static int get_video_frame(VideoState *is, AVFrame *frame) {
                     // 记录丢帧数量
                     is->frame_drops_early++;
                     av_frame_unref(frame); // 解除帧的引用以释放资源
+                    //因为视频比音频慢了,所以选择丢弃帧,所以这一帧是无效的
                     got_picture = 0; // 将 got_picture 设置为 0，表示没有有效图像
                 }
             }
@@ -1969,8 +1970,7 @@ static int configure_filtergraph(AVFilterGraph *graph, const char *filtergraph,
     inputs->next = NULL;
 
     // 解析滤镜字符串
-    if ((ret = avfilter_graph_parse_ptr(graph, filtergraph, &inputs, &outputs,
-                                        NULL)) < 0)
+    if ((ret = avfilter_graph_parse_ptr(graph, filtergraph, &inputs, &outputs, NULL)) < 0)
       goto fail;
   } else {
     // 链接滤镜
@@ -2005,10 +2005,10 @@ static int configure_video_filters(AVFilterGraph *graph, VideoState *is,
   int nb_pix_fmts = 0;
   int i, j;
 
+  //ffmpeg像素格式转换到SDL像素格式
   for (i = 0; i < renderer_info.num_texture_formats; i++) {
     for (j = 0; j < FF_ARRAY_ELEMS(sdl_texture_format_map) - 1; j++) {
-      if (renderer_info.texture_formats[i] ==
-          sdl_texture_format_map[j].texture_fmt) {
+      if (renderer_info.texture_formats[i] == sdl_texture_format_map[j].texture_fmt) {
         pix_fmts[nb_pix_fmts++] = sdl_texture_format_map[j].format;
         break;
       }
@@ -2157,31 +2157,24 @@ static int configure_audio_filters(VideoState *is, const char *afilters,
                                  AV_SAMPLE_FMT_NONE, AV_OPT_SEARCH_CHILDREN)) <
       0)
     goto end;
-  if ((ret = av_opt_set_int(filt_asink, "all_channel_counts", 1,
-                            AV_OPT_SEARCH_CHILDREN)) < 0)
+  if ((ret = av_opt_set_int(filt_asink, "all_channel_counts", 1, AV_OPT_SEARCH_CHILDREN)) < 0)
     goto end;
 
   if (force_output_format) {
     channel_layouts[0] = is->audio_tgt.channel_layout;
     channels[0] = is->audio_tgt.channel_layout ? -1 : is->audio_tgt.channels;
     sample_rates[0] = is->audio_tgt.freq;
-    if ((ret = av_opt_set_int(filt_asink, "all_channel_counts", 0,
-                              AV_OPT_SEARCH_CHILDREN)) < 0)
+    if ((ret = av_opt_set_int(filt_asink, "all_channel_counts", 0, AV_OPT_SEARCH_CHILDREN)) < 0)
       goto end;
-    if ((ret =
-             av_opt_set_int_list(filt_asink, "channel_layouts", channel_layouts,
-                                 -1, AV_OPT_SEARCH_CHILDREN)) < 0)
+    if ((ret = av_opt_set_int_list(filt_asink, "channel_layouts", channel_layouts, -1, AV_OPT_SEARCH_CHILDREN)) < 0)
       goto end;
-    if ((ret = av_opt_set_int_list(filt_asink, "channel_counts", channels, -1,
-                                   AV_OPT_SEARCH_CHILDREN)) < 0)
+    if ((ret = av_opt_set_int_list(filt_asink, "channel_counts", channels, -1,AV_OPT_SEARCH_CHILDREN)) < 0)
       goto end;
-    if ((ret = av_opt_set_int_list(filt_asink, "sample_rates", sample_rates, -1,
-                                   AV_OPT_SEARCH_CHILDREN)) < 0)
+    if ((ret = av_opt_set_int_list(filt_asink, "sample_rates", sample_rates, -1, AV_OPT_SEARCH_CHILDREN)) < 0)
       goto end;
   }
 
-  if ((ret = configure_filtergraph(is->agraph, afilters, filt_asrc,
-                                   filt_asink)) < 0)
+  if ((ret = configure_filtergraph(is->agraph, afilters, filt_asrc, filt_asink)) < 0)
     goto end;
 
   is->in_audio_filter = filt_asrc;
@@ -2220,26 +2213,22 @@ static int audio_thread(void *arg) {
       tb = (AVRational){1, frame->sample_rate};
 
 #if CONFIG_AVFILTER
-      dec_channel_layout =
-          get_valid_channel_layout(frame->channel_layout, frame->channels);
+      dec_channel_layout = get_valid_channel_layout(frame->channel_layout, frame->channels);
 
       //解码出来的frame音频格式和入口滤镜要求的音频格式不一样，需要重建滤镜
-      reconfigure = cmp_audio_fmts(is->audio_filter_src.fmt,
-                                   is->audio_filter_src.channels, frame->format,
-                                   frame->channels) ||
+      reconfigure = cmp_audio_fmts(is->audio_filter_src.fmt, is->audio_filter_src.channels, 
+                                   frame->format, frame->channels) ||
                     is->audio_filter_src.channel_layout != dec_channel_layout ||
-                    is->audio_filter_src.freq != frame->sample_rate ||
-                    is->auddec.pkt_serial != last_serial;
+                    is->audio_filter_src.freq           != frame->sample_rate ||
+                    is->auddec.pkt_serial               != last_serial;
       //需要重建滤镜的情况
       //1，容器层记录的采样率等信息是错误的，与实际解码出来的不符。
       //2，解码过程中，中途解码出来的 AVFrame 的采样率，声道数或者采样格式 出现变动，与上一次解码出来的 AVFrame 不一样。
       //3，进行了快进快退操作，因为快进快退会导致 is->auddec.pkt_serial 递增。详情请阅读《FFplay序列号分析》。
       if (reconfigure) {
         char buf1[1024], buf2[1024];
-        av_get_channel_layout_string(buf1, sizeof(buf1), -1,
-                                     is->audio_filter_src.channel_layout);
-        av_get_channel_layout_string(buf2, sizeof(buf2), -1,
-                                     dec_channel_layout);
+        av_get_channel_layout_string(buf1, sizeof(buf1), -1, is->audio_filter_src.channel_layout);
+        av_get_channel_layout_string(buf2, sizeof(buf2), -1, dec_channel_layout);
         av_log(NULL, AV_LOG_DEBUG,
                "Audio frame changed from rate:%d ch:%d fmt:%s layout:%s "
                "serial:%d to rate:%d ch:%d fmt:%s layout:%s serial:%d\n",
@@ -2263,20 +2252,17 @@ static int audio_thread(void *arg) {
         goto the_end;
 
       //不断刷完滤镜中的缓存
-      while ((ret = av_buffersink_get_frame_flags(is->out_audio_filter, frame,
-                                                  0)) >= 0) {
+      while ((ret = av_buffersink_get_frame_flags(is->out_audio_filter, frame, 0)) >= 0) {
         tb = av_buffersink_get_time_base(is->out_audio_filter);
 #endif
         //从FrameQueue里面取一个可以写的frame出来
         if (!(af = frame_queue_peek_writable(&is->sampq)))
           goto the_end;
 
-        af->pts =
-            (frame->pts == AV_NOPTS_VALUE) ? NAN : frame->pts * av_q2d(tb);
+        af->pts = (frame->pts == AV_NOPTS_VALUE) ? NAN : frame->pts * av_q2d(tb);
         af->pos = frame->pkt_pos;
         af->serial = is->auddec.pkt_serial;
-        af->duration =
-            av_q2d((AVRational){frame->nb_samples, frame->sample_rate});
+        af->duration = av_q2d((AVRational){frame->nb_samples, frame->sample_rate});
 
         av_frame_move_ref(af->frame, frame);
         //队列索引值+1
@@ -2467,8 +2453,7 @@ static int subtitle_thread(void *arg) {
 }
 
 /* copy samples for viewing in editor window */
-static void update_sample_display(VideoState *is, short *samples,
-                                  int samples_size) {
+static void update_sample_display(VideoState *is, short *samples, int samples_size) {
   int size, len;
 
   size = samples_size / sizeof(short);
@@ -2476,8 +2461,7 @@ static void update_sample_display(VideoState *is, short *samples,
     len = SAMPLE_ARRAY_SIZE - is->sample_array_index;
     if (len > size)
       len = size;
-    memcpy(is->sample_array + is->sample_array_index, samples,
-           len * sizeof(short));
+    memcpy(is->sample_array + is->sample_array_index, samples, len * sizeof(short));
     samples += len;
     is->sample_array_index += len;
     if (is->sample_array_index >= SAMPLE_ARRAY_SIZE)
@@ -2570,13 +2554,11 @@ static int audio_decode_frame(VideoState *is) {
   } while (af->serial != is->audioq.serial);
 
   //计算frame大小
-  data_size = av_samples_get_buffer_size(
-      NULL, af->frame->channels, af->frame->nb_samples, af->frame->format, 1);
+  data_size = av_samples_get_buffer_size(NULL, af->frame->channels, af->frame->nb_samples, af->frame->format, 1);
 
   dec_channel_layout =
       (af->frame->channel_layout &&
-       af->frame->channels ==
-           av_get_channel_layout_nb_channels(af->frame->channel_layout))
+       af->frame->channels == av_get_channel_layout_nb_channels(af->frame->channel_layout))
           ? af->frame->channel_layout
           : av_get_default_channel_layout(af->frame->channels);
   //同步音频流获取样本数量
@@ -2615,11 +2597,8 @@ static int audio_decode_frame(VideoState *is) {
     const uint8_t **in = (const uint8_t **)af->frame->extended_data;
     uint8_t **out = &is->audio_buf1;
     //每声道有多少样本数，建议设置大一点，避免内存不够,所以加上了256
-    int out_count = (int64_t)wanted_nb_samples * is->audio_tgt.freq /
-                        af->frame->sample_rate +
-                    256;
-    int out_size = av_samples_get_buffer_size(NULL, is->audio_tgt.channels,
-                                              out_count, is->audio_tgt.fmt, 0);
+    int out_count = (int64_t)wanted_nb_samples * is->audio_tgt.freq / af->frame->sample_rate + 256;
+    int out_size = av_samples_get_buffer_size(NULL, is->audio_tgt.channels, out_count, is->audio_tgt.fmt, 0);
     int len2;
     if (out_size < 0) {
       av_log(NULL, AV_LOG_ERROR, "av_samples_get_buffer_size() failed\n");
@@ -2654,8 +2633,7 @@ static int audio_decode_frame(VideoState *is) {
     }
     //进行了重采样就指向重采样的缓存
     is->audio_buf = is->audio_buf1;
-    resampled_data_size = len2 * is->audio_tgt.channels *
-                          av_get_bytes_per_sample(is->audio_tgt.fmt);
+    resampled_data_size = len2 * is->audio_tgt.channels * av_get_bytes_per_sample(is->audio_tgt.fmt);
   } else {
     is->audio_buf = af->frame->data[0];
     resampled_data_size = data_size;
@@ -2664,7 +2642,7 @@ static int audio_decode_frame(VideoState *is) {
   audio_clock0 = is->audio_clock;
   /* update the audio clock with the pts */
   if (!isnan(af->pts))
-    //audio_clock代表播放万这一帧数据后音频流的pts是多少
+    //audio_clock代表播放完这一帧数据后音频流的pts是多少
     is->audio_clock = af->pts + (double)af->frame->nb_samples / af->frame->sample_rate;
   else
     is->audio_clock = NAN;
@@ -2696,9 +2674,7 @@ static void sdl_audio_callback(void *opaque, Uint8 *stream, int len) {
       if (audio_size < 0) {
         /* if error, just output silence */
         is->audio_buf = NULL;
-        is->audio_buf_size = SDL_AUDIO_MIN_BUFFER_SIZE /
-                             is->audio_tgt.frame_size *
-                             is->audio_tgt.frame_size;
+        is->audio_buf_size = SDL_AUDIO_MIN_BUFFER_SIZE / is->audio_tgt.frame_size * is->audio_tgt.frame_size;
       } else {
         if (is->show_mode != SHOW_MODE_VIDEO)
           update_sample_display(is, (int16_t *)is->audio_buf, audio_size);
@@ -2713,6 +2689,7 @@ static void sdl_audio_callback(void *opaque, Uint8 *stream, int len) {
     if (!is->muted && is->audio_buf && is->audio_volume == SDL_MIX_MAXVOLUME)
       memcpy(stream, (uint8_t *)is->audio_buf + is->audio_buf_index, len1);
     else {
+      //静音
       memset(stream, 0, len1);
       if (!is->muted && is->audio_buf)
         //下面这个函数有调整音量的功能
@@ -2728,11 +2705,9 @@ static void sdl_audio_callback(void *opaque, Uint8 *stream, int len) {
   /* Let's assume the audio driver that is used by SDL has two periods. */
   //假设sdl打开的设备里是有两段缓存的, 也就是audio_hw_buf_size + len
   if (!isnan(is->audio_clock)) {
-    //记录音频流当前的播放时刻
+    //更新音频时钟, 第二个参数是音频流的播放时刻
     set_clock_at(&is->audclk,
-                 is->audio_clock - (double)(2 * is->audio_hw_buf_size +
-                                            is->audio_write_buf_size) /
-                                       is->audio_tgt.bytes_per_sec,
+                 is->audio_clock - (double)(2 * is->audio_hw_buf_size + is->audio_write_buf_size) / is->audio_tgt.bytes_per_sec,
                  is->audio_clock_serial, audio_callback_time / 1000000.0);
     //用音频时钟同步外部时钟
     sync_clock_to_slave(&is->extclk, &is->audclk);
@@ -2751,12 +2726,10 @@ static int audio_open(void *opaque, int64_t wanted_channel_layout,
   // next_nb_channels[4] = 2，从4声道切换到2声道打开音频设备
   // next_nb_channels[3] = 6，从3声道切换到6声道打开音频设备
   // next_nb_channels[2] = 1，从双声道切换到单声道打开音频设备
-  // next_nb_channels[1] = 0，
-  // 单声道都打不开音频设备，无法再切换，需要降低采样率播放。
-  // next_nb_channels[0] = 0，
-  // 0声道都打不开音频设备，无法再切换，需要降低采样率播放。
+  // next_nb_channels[1] = 0，单声道都打不开音频设备，无法再切换，需要降低采样率播放。
+  // next_nb_channels[0] = 0，0声道都打不开音频设备，无法再切换，需要降低采样率播放。
   static const int next_nb_channels[] = {0, 0, 1, 6, 2, 6, 4, 6};
-  // 当所以声道都不行时需要取一个比当前更小的采样率
+  // 当所有声道都不行时需要取一个比当前更小的采样率
   static const int next_sample_rates[] = {0, 44100, 48000, 96000, 192000};
   int next_sample_rate_idx = FF_ARRAY_ELEMS(next_sample_rates) - 1;
 
@@ -2766,9 +2739,7 @@ static int audio_open(void *opaque, int64_t wanted_channel_layout,
     wanted_channel_layout = av_get_default_channel_layout(wanted_nb_channels);
   }
   // 检验声道数和声道布局是否一致
-  if (!wanted_channel_layout ||
-      wanted_nb_channels !=
-          av_get_channel_layout_nb_channels(wanted_channel_layout)) {
+  if (!wanted_channel_layout || wanted_nb_channels != av_get_channel_layout_nb_channels(wanted_channel_layout)) {
     wanted_channel_layout = av_get_default_channel_layout(wanted_nb_channels);
     wanted_channel_layout &= ~AV_CH_LAYOUT_STEREO_DOWNMIX;
   }
@@ -2780,16 +2751,13 @@ static int audio_open(void *opaque, int64_t wanted_channel_layout,
     return -1;
   }
   // next_sample_rate_idx存储的是比想打开的音频采样率更小的采样率
-  while (next_sample_rate_idx &&
-         next_sample_rates[next_sample_rate_idx] >= wanted_spec.freq)
+  while (next_sample_rate_idx && next_sample_rates[next_sample_rate_idx] >= wanted_spec.freq)
     next_sample_rate_idx--;
   // 重点：设置打开参数，设置回调函数
   wanted_spec.format = AUDIO_S16SYS;
   wanted_spec.silence = 0;
   // 告诉SDL每次回调取多少样本数来播放
-  wanted_spec.samples =
-      FFMAX(SDL_AUDIO_MIN_BUFFER_SIZE,
-            2 << av_log2(wanted_spec.freq / SDL_AUDIO_MAX_CALLBACKS_PER_SEC));
+  wanted_spec.samples = FFMAX(SDL_AUDIO_MIN_BUFFER_SIZE, 2 << av_log2(wanted_spec.freq / SDL_AUDIO_MAX_CALLBACKS_PER_SEC));
   wanted_spec.callback = sdl_audio_callback;
   wanted_spec.userdata = opaque;
   // 不断尝试调整声道和采样打开音频设备
@@ -2837,8 +2805,7 @@ static int audio_open(void *opaque, int64_t wanted_channel_layout,
   audio_hw_params->channel_layout = wanted_channel_layout;
   audio_hw_params->channels = spec.channels;
   //一个音频样本占多少内存
-  audio_hw_params->frame_size = av_samples_get_buffer_size(
-      NULL, audio_hw_params->channels, 1, audio_hw_params->fmt, 1);
+  audio_hw_params->frame_size = av_samples_get_buffer_size(NULL, audio_hw_params->channels, 1, audio_hw_params->fmt, 1);
   //一秒钟要播放多少内存的音频数据
   audio_hw_params->bytes_per_sec = av_samples_get_buffer_size(
       NULL, audio_hw_params->channels, audio_hw_params->freq,
@@ -2871,8 +2838,8 @@ static int stream_component_open(VideoState *is, int stream_index) {
   if (!avctx)
     return AVERROR(ENOMEM);
 
-  ret =
-      avcodec_parameters_to_context(avctx, ic->streams[stream_index]->codecpar);
+  //这个函数在codec_par.c里
+  ret = avcodec_parameters_to_context(avctx, ic->streams[stream_index]->codecpar);
   if (ret < 0)
     goto fail;
   avctx->pkt_timebase = ic->streams[stream_index]->time_base;
@@ -2921,8 +2888,7 @@ static int stream_component_open(VideoState *is, int stream_index) {
     avctx->flags2 |= AV_CODEC_FLAG2_FAST;
 
   // 提取命令行参数
-  opts = filter_codec_opts(codec_opts, avctx->codec_id, ic,
-                           ic->streams[stream_index], codec);
+  opts = filter_codec_opts(codec_opts, avctx->codec_id, ic, ic->streams[stream_index], codec);
   if (!av_dict_get(opts, "threads", NULL, 0))
     // 如果没有设置线程，则根据硬件自动选择线程数
     av_dict_set(&opts, "threads", "auto", 0);
@@ -2950,8 +2916,7 @@ static int stream_component_open(VideoState *is, int stream_index) {
 
     is->audio_filter_src.freq = avctx->sample_rate;
     is->audio_filter_src.channels = avctx->channels;
-    is->audio_filter_src.channel_layout =
-        get_valid_channel_layout(avctx->channel_layout, avctx->channels);
+    is->audio_filter_src.channel_layout = get_valid_channel_layout(avctx->channel_layout, avctx->channels);
     is->audio_filter_src.fmt = avctx->sample_fmt;
     // 创建音频流的滤镜,设置好输入滤镜和输出滤镜
     // 解码器输出 AVFrame 之后需要往 in_audio_filter 里面丢，然后播放的时候，
@@ -2973,8 +2938,7 @@ static int stream_component_open(VideoState *is, int stream_index) {
     /* prepare audio output */
     // 调用sdl_openDevice打开音频设备(有些音频设置不被硬件支持，所以需要重新设置，
     // 最终设置好的音频信息放在audio_tgt里)
-    if ((ret = audio_open(is, channel_layout, nb_channels, sample_rate,
-                          &is->audio_tgt)) < 0)
+    if ((ret = audio_open(is, channel_layout, nb_channels, sample_rate, &is->audio_tgt)) < 0)
       goto fail;
     //当内部还剩audio_hw_buf_size长度的数据就会调sdl_audio_callback来拿数据
     is->audio_hw_buf_size = ret;
@@ -2996,18 +2960,15 @@ static int stream_component_open(VideoState *is, int stream_index) {
     is->audio_stream = stream_index;
     is->audio_st = ic->streams[stream_index];
 
-    if ((ret = decoder_init(&is->auddec, avctx, &is->audioq,
-                            is->continue_read_thread)) < 0)
+    if ((ret = decoder_init(&is->auddec, avctx, &is->audioq, is->continue_read_thread)) < 0)
       goto fail;
-    if ((is->ic->iformat->flags &
-         (AVFMT_NOBINSEARCH | AVFMT_NOGENSEARCH | AVFMT_NO_BYTE_SEEK)) &&
+    if ((is->ic->iformat->flags & (AVFMT_NOBINSEARCH | AVFMT_NOGENSEARCH | AVFMT_NO_BYTE_SEEK)) &&
         !is->ic->iformat->read_seek) {
       is->auddec.start_pts = is->audio_st->start_time;
       is->auddec.start_pts_tb = is->audio_st->time_base;
     }
     // 重点：开启音频解码线程
-    if ((ret = decoder_start(&is->auddec, audio_thread, "audio_decoder", is)) <
-        0)
+    if ((ret = decoder_start(&is->auddec, audio_thread, "audio_decoder", is)) < 0)
       goto out;
     SDL_PauseAudioDevice(audio_dev, 0);
     break;
@@ -3015,12 +2976,10 @@ static int stream_component_open(VideoState *is, int stream_index) {
     is->video_stream = stream_index;
     is->video_st = ic->streams[stream_index];
 
-    if ((ret = decoder_init(&is->viddec, avctx, &is->videoq,
-                            is->continue_read_thread)) < 0)
+    if ((ret = decoder_init(&is->viddec, avctx, &is->videoq, is->continue_read_thread)) < 0)
       goto fail;
     // 开启视频解码线程
-    if ((ret = decoder_start(&is->viddec, video_thread, "video_decoder", is)) <
-        0)
+    if ((ret = decoder_start(&is->viddec, video_thread, "video_decoder", is)) < 0)
       goto out;
     is->queue_attachments_req = 1;
     break;
@@ -3028,11 +2987,9 @@ static int stream_component_open(VideoState *is, int stream_index) {
     is->subtitle_stream = stream_index;
     is->subtitle_st = ic->streams[stream_index];
 
-    if ((ret = decoder_init(&is->subdec, avctx, &is->subtitleq,
-                            is->continue_read_thread)) < 0)
+    if ((ret = decoder_init(&is->subdec, avctx, &is->subtitleq, is->continue_read_thread)) < 0)
       goto fail;
-    if ((ret = decoder_start(&is->subdec, subtitle_thread, "subtitle_decoder",
-                             is)) < 0)
+    if ((ret = decoder_start(&is->subdec, subtitle_thread, "subtitle_decoder", is)) < 0)
       goto out;
     break;
   default:
@@ -3163,11 +3120,10 @@ static int read_thread(void *arg) {
     ic->pb->eof_reached = 0; // FIXME hack, ffplay maybe should not use
                              // avio_feof() to test for the end
 
-  // 如果 ic->iformat->flags 包含AVFMT_TS_DISCONT(允许时间戳不连续)，
-  // 并且格式名称不是 "ogg"，则seek_by_bytes 被设置为 1（真）
+  // 如果 ic->iformat->flags 包含AVFMT_TS_DISCONT(时间戳不连续)，
+  // 并且格式名称包含 "ogg"，则seek_by_bytes 被设置为 1（真）
   if (seek_by_bytes < 0)
-    seek_by_bytes = !!(ic->iformat->flags & AVFMT_TS_DISCONT) &&
-                    strcmp("ogg", ic->iformat->name);
+    seek_by_bytes = !!(ic->iformat->flags & AVFMT_TS_DISCONT) && strcmp("ogg", ic->iformat->name);
   // 时间戳连续则设置最大帧持续时间为3600s,否则为10s
   is->max_frame_duration = (ic->iformat->flags & AVFMT_TS_DISCONT) ? 10.0 : 3600.0;
 
@@ -3183,6 +3139,7 @@ static int read_thread(void *arg) {
     /* add the stream start time */
     if (ic->start_time != AV_NOPTS_VALUE)
       timestamp += ic->start_time;
+       //寻址到指定位置,指定的时间戳在MIN和MAX之间
     ret = avformat_seek_file(ic, -1, INT64_MIN, timestamp, INT64_MAX, 0);
     if (ret < 0) {
       av_log(NULL, AV_LOG_WARNING, "%s: could not seek to position %0.3f\n",
@@ -3214,18 +3171,16 @@ static int read_thread(void *arg) {
   }
 
   if (!video_disable)
-    st_index[AVMEDIA_TYPE_VIDEO] = av_find_best_stream(
-        ic, AVMEDIA_TYPE_VIDEO, st_index[AVMEDIA_TYPE_VIDEO], -1, NULL, 0);
+    st_index[AVMEDIA_TYPE_VIDEO] = 
+       av_find_best_stream(ic, AVMEDIA_TYPE_VIDEO, st_index[AVMEDIA_TYPE_VIDEO], -1, NULL, 0);
   if (!audio_disable)
-    st_index[AVMEDIA_TYPE_AUDIO] = av_find_best_stream(
-        ic, AVMEDIA_TYPE_AUDIO, st_index[AVMEDIA_TYPE_AUDIO],
+    st_index[AVMEDIA_TYPE_AUDIO] 
+       = av_find_best_stream(ic, AVMEDIA_TYPE_AUDIO, st_index[AVMEDIA_TYPE_AUDIO],
         st_index[AVMEDIA_TYPE_VIDEO], NULL, 0);
   if (!video_disable && !subtitle_disable)
-    st_index[AVMEDIA_TYPE_SUBTITLE] = av_find_best_stream(
-        ic, AVMEDIA_TYPE_SUBTITLE, st_index[AVMEDIA_TYPE_SUBTITLE],
-        (st_index[AVMEDIA_TYPE_AUDIO] >= 0 ? st_index[AVMEDIA_TYPE_AUDIO]
-                                           : st_index[AVMEDIA_TYPE_VIDEO]),
-        NULL, 0);
+    st_index[AVMEDIA_TYPE_SUBTITLE] 
+       = av_find_best_stream(ic, AVMEDIA_TYPE_SUBTITLE, st_index[AVMEDIA_TYPE_SUBTITLE],
+        (st_index[AVMEDIA_TYPE_AUDIO] >= 0 ? st_index[AVMEDIA_TYPE_AUDIO] : st_index[AVMEDIA_TYPE_VIDEO]), NULL, 0);
 
   is->show_mode = show_mode;
   if (st_index[AVMEDIA_TYPE_VIDEO] >= 0) {
@@ -3279,8 +3234,7 @@ static int read_thread(void *arg) {
         av_read_play(ic);
     }
 #if CONFIG_RTSP_DEMUXER || CONFIG_MMSH_PROTOCOL
-    if (is->paused && (!strcmp(ic->iformat->name, "rtsp") ||
-                       (ic->pb && !strncmp(input_filename, "mmsh:", 5)))) {
+    if (is->paused && (!strcmp(ic->iformat->name, "rtsp") || (ic->pb && !strncmp(input_filename, "mmsh:", 5)))) {
       /* wait 10 ms to avoid trying to get another packet */
       /* XXX: horrible */
       SDL_Delay(10);
@@ -3299,8 +3253,7 @@ static int read_thread(void *arg) {
       if (ret < 0) {
         av_log(NULL, AV_LOG_ERROR, "%s: error while seeking\n", is->ic->url);
       } else {
-        // 在进行 seek
-        // 操作时，可能会导致当前的音频、视频和字幕队列中的数据不再有效。
+        // 在进行 seek操作时，可能会导致当前的音频、视频和字幕队列中的数据不再有效。
         // 通过调用 packet_queue_flush，可以清空这些队列
         if (is->audio_stream >= 0)
           packet_queue_flush(&is->audioq);
@@ -3322,8 +3275,7 @@ static int read_thread(void *arg) {
         step_to_next_frame(is);
     }
     if (is->queue_attachments_req) {
-      if (is->video_st &&
-          is->video_st->disposition & AV_DISPOSITION_ATTACHED_PIC) {
+      if (is->video_st && is->video_st->disposition & AV_DISPOSITION_ATTACHED_PIC) {
         if ((ret = av_packet_ref(pkt, &is->video_st->attached_pic)) < 0)
           goto fail;
         packet_queue_put(&is->videoq, pkt);
@@ -3334,14 +3286,10 @@ static int read_thread(void *arg) {
 
     /* if the queue are full, no need to read more */
     if (infinite_buffer < 1 &&
-        (is->audioq.size + is->videoq.size + is->subtitleq.size >
-             MAX_QUEUE_SIZE ||
-         (stream_has_enough_packets(is->audio_st, is->audio_stream,
-                                    &is->audioq) &&
-          stream_has_enough_packets(is->video_st, is->video_stream,
-                                    &is->videoq) &&
-          stream_has_enough_packets(is->subtitle_st, is->subtitle_stream,
-                                    &is->subtitleq)))) {
+        (is->audioq.size + is->videoq.size + is->subtitleq.size > MAX_QUEUE_SIZE ||
+         (stream_has_enough_packets(is->audio_st, is->audio_stream, &is->audioq) &&
+          stream_has_enough_packets(is->video_st, is->video_stream, &is->videoq) &&
+          stream_has_enough_packets(is->subtitle_st, is->subtitle_stream, &is->subtitleq)))) {
       /* wait 10 ms */
       SDL_LockMutex(wait_mutex);
       SDL_CondWaitTimeout(is->continue_read_thread, wait_mutex, 10);
@@ -3378,6 +3326,7 @@ static int read_thread(void *arg) {
           break;
       }
       SDL_LockMutex(wait_mutex);
+      //休眠10s
       SDL_CondWaitTimeout(is->continue_read_thread, wait_mutex, 10);
       SDL_UnlockMutex(wait_mutex);
       continue;
@@ -3472,8 +3421,7 @@ static VideoState *stream_open(const char *filename, AVInputFormat *iformat) {
   if (startup_volume > 100)
     av_log(NULL, AV_LOG_WARNING, "-volume=%d > 100, setting to 100\n",
            startup_volume);
-  startup_volume =
-      av_clip(startup_volume, 0, 100); // 即如果在0，100之间就取volume
+  startup_volume = av_clip(startup_volume, 0, 100); // 即如果在0，100之间就取volume
   // 第二次调用将音量值变为sdl百分比音量值
   startup_volume =
       av_clip(SDL_MIX_MAXVOLUME * startup_volume / 100, 0, SDL_MIX_MAXVOLUME);
@@ -3938,194 +3886,60 @@ static int opt_codec(void *optctx, const char *opt, const char *arg) {
 
 static int dummy;
 
+//命令行参数解析结构
 static const OptionDef options[] = {
-    CMDUTILS_COMMON_OPTIONS{"x",
-                            HAS_ARG,
-                            {.func_arg = opt_width},
-                            "force displayed width",
-                            "width"},
-    {"y",
-     HAS_ARG,
-     {.func_arg = opt_height},
-     "force displayed height",
-     "height"},
-    {"s",
-     HAS_ARG | OPT_VIDEO,
-     {.func_arg = opt_frame_size},
-     "set frame size (WxH or abbreviation)",
-     "size"},
+    CMDUTILS_COMMON_OPTIONS
+    {"x", HAS_ARG, {.func_arg = opt_width}, "force displayed width","width"},
+    {"y", HAS_ARG, {.func_arg = opt_height}, "force displayed height","height"},
+    {"s", HAS_ARG | OPT_VIDEO, {.func_arg = opt_frame_size}, "set frame size (WxH or abbreviation)","size"},
     {"fs", OPT_BOOL, {&is_full_screen}, "force full screen"},
     {"an", OPT_BOOL, {&audio_disable}, "disable audio"},
     {"vn", OPT_BOOL, {&video_disable}, "disable video"},
     {"sn", OPT_BOOL, {&subtitle_disable}, "disable subtitling"},
-    {"ast",
-     OPT_STRING | HAS_ARG | OPT_EXPERT,
-     {&wanted_stream_spec[AVMEDIA_TYPE_AUDIO]},
-     "select desired audio stream",
-     "stream_specifier"},
-    {"vst",
-     OPT_STRING | HAS_ARG | OPT_EXPERT,
-     {&wanted_stream_spec[AVMEDIA_TYPE_VIDEO]},
-     "select desired video stream",
-     "stream_specifier"},
-    {"sst",
-     OPT_STRING | HAS_ARG | OPT_EXPERT,
-     {&wanted_stream_spec[AVMEDIA_TYPE_SUBTITLE]},
-     "select desired subtitle stream",
-     "stream_specifier"},
-    {"ss",
-     HAS_ARG,
-     {.func_arg = opt_seek},
-     "seek to a given position in seconds",
-     "pos"},
-    {"t",
-     HAS_ARG,
-     {.func_arg = opt_duration},
-     "play  \"duration\" seconds of audio/video",
-     "duration"},
-    {"bytes",
-     OPT_INT | HAS_ARG,
-     {&seek_by_bytes},
-     "seek by bytes 0=off 1=on -1=auto",
-     "val"},
-    {"seek_interval",
-     OPT_FLOAT | HAS_ARG,
-     {&seek_interval},
-     "set seek interval for left/right keys, in seconds",
-     "seconds"},
+    {"ast",OPT_STRING | HAS_ARG | OPT_EXPERT,{&wanted_stream_spec[AVMEDIA_TYPE_AUDIO]},"select desired audio stream","stream_specifier"},
+    {"vst", OPT_STRING | HAS_ARG | OPT_EXPERT, {&wanted_stream_spec[AVMEDIA_TYPE_VIDEO]}, "select desired video stream", "stream_specifier"},
+    {"sst", OPT_STRING | HAS_ARG | OPT_EXPERT, {&wanted_stream_spec[AVMEDIA_TYPE_SUBTITLE]}, "select desired subtitle stream", "stream_specifier"},
+    {"ss", HAS_ARG, {.func_arg = opt_seek}, "seek to a given position in seconds", "pos"},
+    {"t", HAS_ARG, {.func_arg = opt_duration}, "play  \"duration\" seconds of audio/video", "duration"},
+    {"bytes", OPT_INT | HAS_ARG, {&seek_by_bytes}, "seek by bytes 0=off 1=on -1=auto", "val"},
+    {"seek_interval", OPT_FLOAT | HAS_ARG, {&seek_interval}, "set seek interval for left/right keys, in seconds", "seconds"},
     {"nodisp", OPT_BOOL, {&display_disable}, "disable graphical display"},
     {"noborder", OPT_BOOL, {&borderless}, "borderless window"},
     {"alwaysontop", OPT_BOOL, {&alwaysontop}, "window always on top"},
-    {"volume",
-     OPT_INT | HAS_ARG,
-     {&startup_volume},
-     "set startup volume 0=min 100=max",
-     "volume"},
+    {"volume", OPT_INT | HAS_ARG, {&startup_volume}, "set startup volume 0=min 100=max", "volume"},
     {"f", HAS_ARG, {.func_arg = opt_format}, "force format", "fmt"},
-    {"pix_fmt",
-     HAS_ARG | OPT_EXPERT | OPT_VIDEO,
-     {.func_arg = opt_frame_pix_fmt},
-     "set pixel format",
-     "format"},
+    {"pix_fmt", HAS_ARG | OPT_EXPERT | OPT_VIDEO, {.func_arg = opt_frame_pix_fmt}, "set pixel format", "format"},
     {"stats", OPT_BOOL | OPT_EXPERT, {&show_status}, "show status", ""},
-    {"fast",
-     OPT_BOOL | OPT_EXPERT,
-     {&fast},
-     "non spec compliant optimizations",
-     ""},
+    {"fast", OPT_BOOL | OPT_EXPERT, {&fast}, "non spec compliant optimizations", ""},
     {"genpts", OPT_BOOL | OPT_EXPERT, {&genpts}, "generate pts", ""},
-    {"drp",
-     OPT_INT | HAS_ARG | OPT_EXPERT,
-     {&decoder_reorder_pts},
-     "let decoder reorder pts 0=off 1=on -1=auto",
-     ""},
+    {"drp", OPT_INT | HAS_ARG | OPT_EXPERT, {&decoder_reorder_pts}, "let decoder reorder pts 0=off 1=on -1=auto", ""},
     {"lowres", OPT_INT | HAS_ARG | OPT_EXPERT, {&lowres}, "", ""},
-    {"sync",
-     HAS_ARG | OPT_EXPERT,
-     {.func_arg = opt_sync},
-     "set audio-video sync. type (type=audio/video/ext)",
-     "type"},
+    {"sync", HAS_ARG | OPT_EXPERT, {.func_arg = opt_sync}, "set audio-video sync. type (type=audio/video/ext)", "type"},
     {"autoexit", OPT_BOOL | OPT_EXPERT, {&autoexit}, "exit at the end", ""},
-    {"exitonkeydown",
-     OPT_BOOL | OPT_EXPERT,
-     {&exit_on_keydown},
-     "exit on key down",
-     ""},
-    {"exitonmousedown",
-     OPT_BOOL | OPT_EXPERT,
-     {&exit_on_mousedown},
-     "exit on mouse down",
-     ""},
-    {"loop",
-     OPT_INT | HAS_ARG | OPT_EXPERT,
-     {&loop},
-     "set number of times the playback shall be looped",
-     "loop count"},
-    {"framedrop",
-     OPT_BOOL | OPT_EXPERT,
-     {&framedrop},
-     "drop frames when cpu is too slow",
-     ""},
-    {"infbuf",
-     OPT_BOOL | OPT_EXPERT,
-     {&infinite_buffer},
-     "don't limit the input buffer size (useful with realtime streams)",
-     ""},
-    {"window_title",
-     OPT_STRING | HAS_ARG,
-     {&window_title},
-     "set window title",
-     "window title"},
-    {"left",
-     OPT_INT | HAS_ARG | OPT_EXPERT,
-     {&screen_left},
-     "set the x position for the left of the window",
-     "x pos"},
-    {"top",
-     OPT_INT | HAS_ARG | OPT_EXPERT,
-     {&screen_top},
-     "set the y position for the top of the window",
-     "y pos"},
+    {"exitonkeydown", OPT_BOOL | OPT_EXPERT, {&exit_on_keydown}, "exit on key down", ""},
+    {"exitonmousedown", OPT_BOOL | OPT_EXPERT, {&exit_on_mousedown}, "exit on mouse down", ""},
+    {"loop", OPT_INT | HAS_ARG | OPT_EXPERT, {&loop}, "set number of times the playback shall be looped", "loop count"},
+    {"framedrop", OPT_BOOL | OPT_EXPERT, {&framedrop}, "drop frames when cpu is too slow", ""},
+    {"infbuf", OPT_BOOL | OPT_EXPERT, {&infinite_buffer}, "don't limit the input buffer size (useful with realtime streams)", ""},
+    {"window_title", OPT_STRING | HAS_ARG, {&window_title}, "set window title", "window title"},
+    {"left", OPT_INT | HAS_ARG | OPT_EXPERT, {&screen_left}, "set the x position for the left of the window", "x pos"},
+    {"top", OPT_INT | HAS_ARG | OPT_EXPERT, {&screen_top}, "set the y position for the top of the window", "y pos"},
 #if CONFIG_AVFILTER
-    {"vf",
-     OPT_EXPERT | HAS_ARG,
-     {.func_arg = opt_add_vfilter},
-     "set video filters",
-     "filter_graph"},
-    {"af",
-     OPT_STRING | HAS_ARG,
-     {&afilters},
-     "set audio filters",
-     "filter_graph"},
+    {"vf", OPT_EXPERT | HAS_ARG, {.func_arg = opt_add_vfilter}, "set video filters", "filter_graph"},
+    {"af", OPT_STRING | HAS_ARG, {&afilters}, "set audio filters", "filter_graph"},
 #endif
-    {"rdftspeed",
-     OPT_INT | HAS_ARG | OPT_AUDIO | OPT_EXPERT,
-     {&rdftspeed},
-     "rdft speed",
-     "msecs"},
-    {"showmode",
-     HAS_ARG,
-     {.func_arg = opt_show_mode},
-     "select show mode (0 = video, 1 = waves, 2 = RDFT)",
-     "mode"},
-    {"default",
-     HAS_ARG | OPT_AUDIO | OPT_VIDEO | OPT_EXPERT,
-     {.func_arg = opt_default},
-     "generic catch all option",
-     ""},
+    {"rdftspeed", OPT_INT | HAS_ARG | OPT_AUDIO | OPT_EXPERT, {&rdftspeed}, "rdft speed", "msecs"},
+    {"showmode", HAS_ARG, {.func_arg = opt_show_mode}, "select show mode (0 = video, 1 = waves, 2 = RDFT)", "mode"},
+    {"default", HAS_ARG | OPT_AUDIO | OPT_VIDEO | OPT_EXPERT, {.func_arg = opt_default}, "generic catch all option", ""},
     {"i", OPT_BOOL, {&dummy}, "read specified file", "input_file"},
-    {"codec",
-     HAS_ARG,
-     {.func_arg = opt_codec},
-     "force decoder",
-     "decoder_name"},
-    {"acodec",
-     HAS_ARG | OPT_STRING | OPT_EXPERT,
-     {&audio_codec_name},
-     "force audio decoder",
-     "decoder_name"},
-    {"scodec",
-     HAS_ARG | OPT_STRING | OPT_EXPERT,
-     {&subtitle_codec_name},
-     "force subtitle decoder",
-     "decoder_name"},
-    {"vcodec",
-     HAS_ARG | OPT_STRING | OPT_EXPERT,
-     {&video_codec_name},
-     "force video decoder",
-     "decoder_name"},
+    {"codec", HAS_ARG, {.func_arg = opt_codec}, "force decoder", "decoder_name"},
+    {"acodec", HAS_ARG | OPT_STRING | OPT_EXPERT, {&audio_codec_name}, "force audio decoder", "decoder_name"},
+    {"scodec", HAS_ARG | OPT_STRING | OPT_EXPERT, {&subtitle_codec_name}, "force subtitle decoder", "decoder_name"},
+    {"vcodec", HAS_ARG | OPT_STRING | OPT_EXPERT, {&video_codec_name}, "force video decoder", "decoder_name"},
     {"autorotate", OPT_BOOL, {&autorotate}, "automatically rotate video", ""},
-    {"find_stream_info",
-     OPT_BOOL | OPT_INPUT | OPT_EXPERT,
-     {&find_stream_info},
-     "read and decode the streams to fill missing information with heuristics"},
-    {"filter_threads",
-     HAS_ARG | OPT_INT | OPT_EXPERT,
-     {&filter_nbthreads},
-     "number of filter threads per graph"},
-    {
-        NULL,
-    },
+    {"find_stream_info", OPT_BOOL | OPT_INPUT | OPT_EXPERT, {&find_stream_info}, "read and decode the streams to fill missing information with heuristics"},
+    {"filter_threads", HAS_ARG | OPT_INT | OPT_EXPERT, {&filter_nbthreads}, "number of filter threads per graph"},
+    { NULL, },
 };
 
 
@@ -4199,6 +4013,7 @@ int main(int argc, char **argv) {
   // 打印版权
   show_banner(argc, argv, options);
 
+  //解析命令行参数
   parse_options(NULL, argc, argv, options, opt_input_file);
 
   if (!input_filename) {
